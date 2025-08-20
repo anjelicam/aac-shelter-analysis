@@ -2,7 +2,7 @@
 
 ### About This Project
 
-This repository contains an applied data science project analyzing intake and outcome data from the **Austin Animal Center (2013–2025)**.
+This repository contains an applied data science project analyzing intake and outcome data from the **[Austin Animal Center Intake & Outcome Data](https://data.austintexas.gov/)**.
 
 The analysis focuses on **repeat intakes of dogs**, exploring:
 * Which dogs are most likely to return to the shelter
