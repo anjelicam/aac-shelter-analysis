@@ -65,10 +65,7 @@ Findings suggest that shelters may benefit from:
 quarto render Anjelica-Martinez-Final-Project-v2.qmd
 ```
 
-**Author**
-
-Anjelica Martinez
-
-Transitioning into AI & Behavioral Data Science
-
+**Author**  
+Anjelica Martinez  
+Transitioning into AI & Behavioral Data Science  
 [LinkedIn Profile](https://www.linkedin.com/in/anjelicamartinez/)
