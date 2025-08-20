@@ -66,6 +66,9 @@ quarto render Anjelica-Martinez-Final-Project-v2.qmd
 ```
 
 **Author**
+
 Anjelica Martinez
+
 Transitioning into AI & Behavioral Data Science
+
 [LinkedIn Profile](https://www.linkedin.com/in/anjelicamartinez/)
