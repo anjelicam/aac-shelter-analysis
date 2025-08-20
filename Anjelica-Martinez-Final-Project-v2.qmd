@@ -1,0 +1,1803 @@
+---
+title: "Final Project: Austin Animal Center Analysis"
+author: "Anjelica Martinez"
+date: "last-modified"
+format:
+  html:
+    self-contained: true
+    embed-resources: true
+    toc: true
+    toc-depth: 2
+    code-fold: true            # make code blocks collapsible
+    code-summary: "Show code"  # toggle text
+    code-tools: true           # adds “Show/Hide All Code” + copy button
+    number-sections: false
+execute:
+  echo: true                   # code is shown (but folded by default)
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: Packages
+#| message: false
+#| warning: false
+#| include: false
+
+# Libraries used
+library(dplyr)      # data manipulation
+library(tidyr)      # reshape data (wide ↔ long)
+library(lubridate)  # work with dates/times
+library(readr)      # read CSV and other flat files
+library(forcats)    # handle categorical variables
+library(stringr)    # string/text operations
+library(here)       # manage file paths
+library(janitor)    # clean messy data
+library(ggplot2)    # create plots
+library(purrr)      # functional programming / iteration
+library(scales)     # format axes, labels, colors
+library(patchwork)  # combine multiple plots
+library(gt)         # make clean, professional tables
+library(ggrepel)    # better text labels on plots
+library(grid)       # fine-tune plot layout
+library(zoo)        # rolling averages (e.g., rollmean())
+
+```
+
+[![Illustration by Sara Oliveira (Unsplash+)](images/premium_vector-1745362596868-364da9841826%20(1).avif){fig-alt="llustrated scene of a veterinary clinic where a smiling veterinarian in teal scrubs and yellow clogs is lying on the floor with four happy dogs. One dog is wearing a medical cone, another has a bandaged leg, one has a stethoscope around its neck, and another dark dog is sitting upright on a colorful blanket. The setting is warm and caring, with medical and pet items visible in the background."}](https://unsplash.com/illustrations/a-vet-and-dogs-are-hanging-out-together-jSnSduhy-vM)
+
+# Shelter Stories in the Data
+
+## An analysis of the Austin Animal Center (AAC) intake and outcomes dataset
+
+For this project, I used the [Austin Animal Center (AAC) dataset](https://data.austintexas.gov/browse?q=animal&sortBy=relevance&page=1&pageSize=20), which comes from the [City of Austin’s open data portal](https://data.austintexas.gov/). Each row represents a single animal and its outcome: adoption, transfer, euthanasia, or return-to-owner. Alongside that outcome, the dataset records things like species, breed, age at intake, sex, and intake type. Every row represents one shelter animal's visit to the center, a piece of their story.
+
+The dataset spans from mid-2013 through mid-2025 and includes over 130,000 animals. Dogs and cats make up the overwhelming majority thought you’ll also see the occasional bat, racoon or chicken sneaking into the records. The breadth of the data makes it perfect for exploring questions about shelter operations, adoption patterns, and the uncomfortable but important reality of euthanasia.
+
+Rather than trying to explore every variable, I focused on the ones that get at meaningful shelter outcomes: how long animals stay at the shelter, what factors affect their likelihood of being adopted, and how these patterns vary across species, breeds, and age groups. These are the kinds of questions that matter for shelter policy, for adopters, and ultimately for the animals themselves.
+
+------------------------------------------------------------------------
+
+## Part 0: Preparing the Data for Analysis
+
+Before I could dig into the fun part of finding patterns, I had to wrestle with the less glamorous side of data science: cleaning. The Austin Animal Center’s intake and outcome datasets are incredibly detailed and updated every single day, which is a goldmine for analysis. But like most real world data, it comes with quirks. Some dates are off, columns don’t always line up, and a few values just don't make sense. So, before chasing insights, I had to make sure the foundation was solid.
+
+### Step 1: Cleaning Up the Outcomes Data
+
+I started with the **outcomes dataset**, which tracks how each animal leaves the shelter, whether through adoption, return to owner, transfer, or unfortunately, euthanasia. It also includes details like breed, sex, and age, making it a rich starting point for understanding patterns.
+
+The first order of business was good old housekeeping!
+
+-   Standardize column names so they play nicely with R.
+
+-   Replace blank strings with proper `NA` values *(so missing data is clearly missing, easier for analysis later)*
+
+-   Convert all the date columns into actual date-time objects instead of text
+
+This setup step may not sound exciting, but it’s the backbone of everything that comes next. Without it, any patterns I found later could have been misleading or completely wrong!
+
+```{r}
+#| label: outcomes-clean
+# Read in the Austin Animal Center Animal Outcomes dataset.
+aac_outcome <- read.csv(here("Data", "aac_outcomes.csv"))
+
+# Clean up column names
+aac_outcome <- aac_outcome |>
+  clean_names() |>
+  mutate(across(everything(), ~ na_if(.x, "")))
+
+# Change date types for columns date_of_birth and date_time
+# - Separate month_year to two separate month and year columns
+aac_outcome <- aac_outcome |>
+  mutate(
+    date_of_birth = ymd(date_of_birth),
+    date_time = ymd_hms(date_time),
+    year = year(date_time),
+    month = month(date_time)
+  ) |>
+  select(-month_year)
+```
+
+### Step 2: Fixing Impossible Ages
+
+**Age** is usually a key piece of the puzzle in shelter research, so I checked how old each dog was when they left the shelter. That’s when I spotted something weird: a handful of dogs had negative ages. What in the world? After some digging, I notied that some of these pup's date of birth's came *after* the date they left the shelter. This must be a data entry error.
+
+To fix it, I:
+
+-   Calculated each dog’s age in days and years.
+
+-   Flagged any cases where the birth date was in the future.
+
+-   Re-coded those impossible ages as incorrect so they could be filtered out and prevent skewing later results.
+
+Even though age didn’t end up being the main focus of my project (the data had other more interesting stories to tell), cleaning it now means the dataset is ready for me (or anyone else) to dig into any age-related patterns in the future without running into sci-fi dogs. (You're welcome.)
+
+```{r}
+#| label: outcomes-age-fix
+# Calculate true ages of animals ------------------------------------
+# - separating into two columns for:
+# -- age in years
+# -- age in days
+aac_outcome <- aac_outcome |>
+  mutate(
+    age_days = as.numeric(
+      difftime(date_time, date_of_birth, units = "days")
+    ),
+    age_years = age_days / 365.25
+  )
+
+# Mark observations that have negative values for their ages
+aac_outcome <- aac_outcome |>
+  mutate(
+    invalid_dob = if_else(date_of_birth > date_time, TRUE, FALSE),
+    age_days = if_else(invalid_dob, NA_real_, age_days),
+    age_years = if_else(invalid_dob, NA_real_, age_years)
+  )
+
+# Rename the column names for easier identification
+aac_outcome <- aac_outcome |>
+  rename(
+    dob = date_of_birth,
+    outcome_datetime = date_time,
+    sex_at_outcome = sex_upon_outcome,
+    reported_age = age_upon_outcome,
+    species = animal_type,
+    outcome_year = year,
+    outcome_month = month,
+    calculated_age_days = age_days,
+    calculated_age_years = age_years,
+    dob_error_flag = invalid_dob
+  )
+```
+
+### Step 3: Cleaning the Intake Data
+
+The intake dataset tells the “arrival story” for each animal, whether they came in as a stray, were surrendered by an owner, or showed up some other way. I gave this dataset the same treatment as the outcomes data: standardized the column names, fixed the date formats, and split the reported age into a clean numeric value plus its unit (days, months, or years).
+
+```{r}
+#| label: intake-clean
+# Read in intake dataset
+aac_intake <- read.csv(here("Data", "aac_intakes.csv"))
+
+# Clean up column names
+aac_intake <- aac_intake |>
+  clean_names()
+
+# Change date types for columns date_of_birth and date_time
+# - Separate month_year to two seperate month and year columns
+aac_intake <- aac_intake |>
+  mutate(
+    datetime_intake = mdy_hms(date_time),
+    year_intake = year(datetime_intake),
+    month_intake = month(datetime_intake)
+  ) |>
+  select(-month_year)
+```
+
+### Step 4: Fixing the Reported Age
+
+One of the quirks in the intake dataset was how age was recorded. Instead of a clean number, it came in as text strings like “3 years” or “8 months.” That might make sense for staff typing quickly, but it’s a nightmare if you want to run calculations.
+
+To fix it, I split the age into two parts:
+
+-   A numeric value (the actual number)
+
+-   A time unit (days, weeks, months, or years)
+
+That way, I could easily convert everything into days or years when I needed to compare across animals. It’s a small step, but without it, the math later would’ve been messy or worse, wrong.
+
+```{r}
+#| label: intake-age-parse
+# Reported Age ----------------------------------------------------------
+# - separate numeral and length type (years/months)
+# - calculate age in days instead
+
+# Builds a lookup table that converts each unit to days
+age_lookup <- tibble(
+  unit_raw = c(
+    "day", "days",
+    "week", "weeks",
+    "month", "months",
+    "year", "years"
+  ),
+  to_days = c(
+    1, 1,
+    7, 7,
+    30.44, 30.44,
+    365.25, 365.25
+  )
+)
+
+# Parses the text column, joins the lookup, and calculates days
+aac_intake <- aac_intake |>
+  separate(age_upon_intake,
+    into = c("age_val", "age_unit"),
+    sep = "\\s+",
+    remove = FALSE
+  ) |>
+  mutate(age_val = as.numeric(age_val)) |>
+  left_join(age_lookup, by = c("age_unit" = "unit_raw")) |>
+  mutate(
+    age_days_intake = age_val * to_days,
+    age_years_intake = age_days_intake / 365.25
+  )
+```
+
+### Step 5: Fixing Missing Names
+
+Not every dog in the dataset had a name. Sometimes the shelter just leaves it blank, which technically shows up as an empty string instead of a true missing value. That can cause problems if R thinks “” is an actual name.
+
+To clean this up, I recoded those blanks as proper missing values (`NA`). It’s a small fix, but it's better to clearly mark “unknown” than to accidentally count a bunch of nameless dogs as having the same weird non-name!
+
+```{r}
+#| label: intake-fix-names
+# Change missing names in name column from empty to NA
+aac_intake <- aac_intake |>
+  mutate(name = na_if(str_squish(name), ""))
+```
+
+### Step 6: Matching Intakes and Outcomes
+
+Because many animals come to the shelter more than once, I needed a reliable way to connect the right intake record with the right outcome record. To do this, I gave each visit a “stay number” and then joined the intake and outcome datasets using both the animal’s ID and their stay number.
+
+From there, I filtered the data down to dogs and pulled out the ones with multiple visits. These repeat visitors became the heart of my analysis. I chose to focus only on dogs, since trying to analyze repeat visits across every species at the shelter would’ve been far too messy (and probably a project of its own).
+
+With the data cleaned, fixed, and matched, I finally had a dataset I could work with. Each visit lined up with the right outcome. From here, I could actually start digging into the fun part: exploring the patterns in which dogs come back to the shelter and what happens to them next!
+
+```{r}
+#| label: join-stays
+# Tags each stay in date order for both intake and outcome dataframes
+aac_intake <- aac_intake |>
+  arrange(animal_id, datetime_intake) |>
+  group_by(animal_id) |>
+  mutate(stay_n = row_number()) |>
+  ungroup()
+
+aac_outcome <- aac_outcome |>
+  arrange(animal_id, outcome_datetime) |>
+  group_by(animal_id) |>
+  mutate(stay_n = row_number()) |>
+  ungroup()
+
+# Joins the two columns by animal id and stay_n
+aac_stays <- aac_intake |>
+  left_join(aac_outcome,
+    by = c("animal_id", "stay_n"),
+    suffix = c("_in", "_out")
+  )
+
+# Create separate dataframe for just dogs
+dogs <- aac_stays |>
+  filter(animal_type %in% "Dog")
+
+# Create a dataframe with a list of each animal-id and the number of total
+# visits they've had
+repeat_ids <- dogs |>
+  group_by(animal_id) |>
+  summarise(n_intakes = n(), .groups = "drop") |>
+  filter(n_intakes > 1)
+
+# Combine above dataframes to create one dataframe of only repeat dogs
+dog_repeat <- dogs |>
+  semi_join(repeat_ids, by = "animal_id")
+```
+
+------------------------------------------------------------------------
+
+## Part 1: All Repeat Dogs — First Look at the Numbers
+
+Before diving into detailed patterns, I wanted to get a sense of the big picture: what do dogs who return to the shelter more than once actually look like as a group?
+
+Across all repeat visitors, the number of stays ranged from just two to a jaw-dropping **33** visits (more on him later).
+
+Most dogs didn’t hit such extremes. On average, a repeat visitor came back about 2.3 times, with the bulk clustering around two or three stays. Ages ran the full spectrum, from a few-day-old puppies to seniors pushing 20, though the average was about 3 years old.
+
+Breed patterns stood out quickly. **Pit Bull Mixes** **topped the list**, followed by Labrador Retriever Mixes and other familiar companion breeds. On the sex side, suprinsingly **neutered males** were the single largest group, even though being fixed is supposed to reduce certain return risks (or so you'd think).
+
+These broad strokes already pointed to two paths worth following:
+
+-   Are certain breeds facing bigger barriers to staying in homes?
+
+-   And why are neutered males (typically considered lower-risk) so over represented among repeat visitors?
+
+::: {.callout-note appearance="“minimal”"}
+**Note:** These numbers come after cleaning and matching intake and outcome records, removing any impossible (negative number) ages. Descriptive stats (range, mean, median, standard deviation) plus frequency counts for breed, sex, intake type, and condition gave this first snapshot.
+:::
+
+```{r}
+#| label: functions-summaries
+
+# Functions for Statistical Summaries --------------------------------------
+# Creates function to provide categorical summary statistics
+cat_stat <- function(x) {
+  if (!is.character(x) && !is.factor(x)) {
+    stop(
+      "This function only works for categorical (character or factor) vectors."
+    )
+  }
+
+  freq_table <- table(x, useNA = "ifany")
+  top_level <- names(freq_table)[which.max(freq_table)]
+  top_count <- max(freq_table, na.rm = TRUE)
+  top_prop <- round(top_count / sum(freq_table), 3)
+
+  tibble(
+    n = length(x),
+    n_na = sum(is.na(x)),
+    n_unique = n_distinct(x),
+    most_common = top_level,
+    most_common_n = top_count,
+    most_common_prop = top_prop
+  )
+}
+
+# Creates a function that runs numeric summary statistics
+sum_stat <- function(x) {
+  if (!is.numeric(x)) {
+    stop("This function only works for numeric vectors.")
+  }
+
+  tibble(
+    range = str_c(min(x, na.rm = TRUE),
+      max(x, na.rm = TRUE),
+      sep = " - "
+    ),
+    mean = mean(x, na.rm = TRUE),
+    median = median(x, na.rm = TRUE),
+    sd = sd(x, na.rm = TRUE),
+    n_na = sum(is.na(x)),
+    n_unique = n_distinct(x)
+  )
+}
+
+# Summary Statistics Calculations ----------------------------------
+
+# Summary statistics of age of dogs with repeat intakes
+num_stats_dogs <- dog_repeat |>
+  select(calculated_age_years) |>
+  map_dfr(sum_stat, .id = "column")
+
+# Summary statistics of the number of times a dog returned to the center
+## I used a separate dataframe with only a total of the number of visits per
+## animal id to run this calculation
+repeat_ids |>
+  select(n_intakes) |>
+  map_dfr(sum_stat, .id = "column")
+
+# Summary statistics for different categories
+cat_stats_dogs <- dog_repeat |>
+  select(animal_id, breed_in, sex_upon_intake, intake_type, intake_condition) |>
+  map_dfr(cat_stat, .id = "column")
+
+# Reviews both summaries
+num_stats_dogs # numeric
+cat_stats_dogs # categorical
+
+
+```
+
+### 1. How Many Times Do Dogs Return to the Shelter?
+
+For most dogs, repeat visits weren’t a regular habit. Nearly **87% of them were one-time returns**, meaning they came back just once and then (hopefully) settled into a more permanent home. Another **12% came back two or three times**, and fewer than 1% showed up four or five times.
+
+The real outliers were rare. Just 109 dogs cycled through six to nine stays, and only six dogs crossed the double-digit mark.
+
+And then there’s the record-holder: one dog with 33 separate stays. That number is so far off the chart it immediately begged for a closer look. Which is exactly what I did next!
+
+```{r}
+#| label: patterns-shelter-intakes
+#| fig-alt: >
+#|   Vertical bar chart showing the distribution of how many times 
+#|   individual dogs returned to the shelter, grouped into bins: 1, 2–3, 4–5, 
+#|   6–9, and 10+ returns. The y-axis represents the number of individual dogs, 
+#|   ranging from 0 to over 70,000, while the x-axis shows the bins of return 
+#|   counts. The largest bar is for dogs with only 1 return (69,551 dogs, 
+#|   86.7%), followed by 2–3 returns (9,917 dogs, 12.4%), 4–5 returns (628 dogs, 
+#|   0.8%), 6–9 returns (109 dogs, 0.1%), and 10+ returns (6 dogs, 0.0%). Data 
+#|   labels above each bar display both the raw count and percentage for that 
+#|   bin.
+#| fig-cap: "Data Provided by City of Austin, Texas - data.austintexas.gov"
+
+# Summarize how many animals had each return count
+return_freq <- dogs |>
+  group_by(animal_id) |>
+  summarise(n_intakes = n(), .groups = "drop")
+
+# Bin the times returned
+repeat_bins <- return_freq |>
+  mutate(
+    bin = case_when(
+      n_intakes == 0 ~ "0",
+      n_intakes == 1 ~ "1",
+      n_intakes %in% 2:3 ~ "2–3",
+      n_intakes %in% 4:5 ~ "4–5",
+      n_intakes %in% 6:9 ~ "6–9",
+      n_intakes >= 10 ~ "10+"
+    ),
+    bin = factor(bin, levels = c("0", "1", "2–3", "4–5", "6–9", "10+"))
+  ) |>
+  count(bin, name = "dogs") |>
+  mutate(pct = dogs / sum(dogs))
+
+# Plot the results
+ggplot(repeat_bins, aes(x = bin, y = dogs)) +
+  geom_col(fill = "#64B5F6") +
+  geom_text(aes(label = paste0(comma(dogs), " (", percent(pct, 0.1), ")")),
+    vjust = -.8, size = 3
+  ) +
+  labs(
+    title = "Number of Times Dogs Returned to Austin Animal Center",
+    subtitle = "Shelter Intake Patterns, 2013–2025",
+    x = "Number of Times a Dog Returned",
+    y = "Number of Dogs",
+    caption = "Data Provided by City of Austin, Texas - data.austintexas.gov"
+  ) +
+  scale_y_continuous(
+    labels = comma,
+    expand = expansion(mult = c(0, 0.08)),
+    limits = c(0, 80000) # extend y-axis
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5, face = "bold", size = 11,
+      margin = margin(b = 5) # add space below title
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5,
+      size = 10,
+      margin = margin(b = 8)
+    ),
+    plot.caption = element_text(
+      hjust = 1,
+      size = 8,
+      color = "gray40",
+      margin = margin(t = 15)
+    ),
+    axis.title.x = element_text(
+      margin = margin(t = 10), face = "bold", size = 9
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 10), face = "bold", size = 9
+    )
+  )
+```
+
+### Snapshot: Lil’ Bit – The Dog With 33 Returns
+
+While most dogs only returned once, a handful became repeat offenders. The most extreme? Lil’ Bit, the Jack Russell with the undisputed record-holder with 33 stays.
+
+Most gaps between visits were short, just a few days or weeks. The median time between stays was about 23.3 days (orange dashed line on the second chart), suggesting a repeating cycle: Lil’ Bit slipped out, ended up at the shelter, and was quickly reclaimed.
+
+But there were exceptions. At one point, he managed nearly a year at home (\~350 days, marked in green) before diving right back into his old routine. His earliest intakes were listed as “stray,” but later ones were usually “Public Assist,” meaning neighbors or community members brought him in.
+
+The chart makes his story clear: each point is both a homecoming and a farewell. His owner always came back for him, but the sheer repetition points to an unsolved problem, whether containment, training, or just one dog’s Houdini-level skills.
+
+Lil’ Bit’s saga is rare, but it sets the stage for a bigger question: are certain breeds more likely to become repeat visitors?
+
+```{r}
+#| label: lil-bit-cum-visits
+#| fig-alt: Line chart showing Lil’ Bit’s cumulative shelter intakes over time from 2016 to 2019, with separate colors indicating intake type. Red points and lines represent Public Assist intakes, while blue points and lines represent Stray intakes. The cumulative intake count starts at 1 in early 2016 and rises steadily, with occasional plateaus, reaching 33 total intakes by late 2019. Public Assist intakes dominate the later years, while early years show a mix of both intake types.
+#| fig-cap: Data Provided by City of Austin, Texas - data.austintexas.gov
+
+
+# Find the dog with the most returns (Lil' Bit)
+top_dog_id <- return_freq |>
+  arrange(desc(n_intakes)) |>
+  slice(1) |>
+  pull(animal_id)
+
+# Build Lil’ Bit’s history
+lil_bit <- aac_stays |>
+  filter(animal_id == top_dog_id) |>
+  arrange(datetime_intake) |>
+  mutate(
+    datetime_intake = as_datetime(datetime_intake),
+    outcome_datetime = as_datetime(outcome_datetime),
+    stay_n = row_number(),
+    days_between = as.numeric(
+      difftime(datetime_intake, lag(datetime_intake), units = "days")
+    )
+  ) |>
+  select(
+    stay_n, datetime_intake, intake_type, age_upon_intake,
+    outcome_datetime, outcome_type, outcome_subtype, reported_age, days_between
+  )
+
+# Plots a cumulative timeline for Lil' Bit
+ggplot(lil_bit, aes(
+  x = datetime_intake, y = stay_n, group = 1, color = intake_type
+)) +
+  geom_line(linewidth = 1, alpha = 0.95) +
+  geom_point(aes(fill = intake_type),
+    shape = 21, size = 2, stroke = 0.2, color = "white"
+  ) +
+  scale_color_manual(values = c(
+    "Public Assist" = "#7CC8AE",
+    "Stray"         = "#2C5AA0"
+  )) +
+  scale_fill_manual(values = c(
+    "Public Assist" = "#7CC8AE",
+    "Stray"         = "#2C5AA0"
+  ), guide = "none") +
+
+  # nice date labels
+  scale_x_datetime(
+    date_breaks = "6 months",
+    date_labels = "%b %Y",
+    expand = expansion(mult = c(0.02, 0.03))
+  ) +
+  scale_y_continuous(
+    limits = c(0, 40),
+    breaks = seq(0, 40, 15),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title = "Cumulative Intakes for Lil’ Bit at Austin Animal Center",
+    subtitle = "Public Assist vs. Stray, 2016–2019",
+    x = "Date of intake (Month – Year)",
+    y = "Total number of intakes (cumulative)",
+    caption = "Data provided by City of Austin, Texas — data.austintexas.gov",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.background = element_rect(fill = "#F8FBF9", color = NA),
+    plot.background = element_rect(fill = "#F8FBF9", color = NA),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle = element_text(
+      hjust = 0.5, size = 10, margin = margin(b = 8)
+    ),
+    axis.title.x = element_text(
+      margin = margin(t = 8), face = "bold", size = 9
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 8), face = "bold", size = 9
+    ),
+    plot.caption = element_text(
+      hjust = 1, size = 8, color = "gray40", margin = margin(t = 12)
+    ),
+    legend.position = "right",
+    legend.text = element_text(size = 9)
+  )
+
+```
+
+```{r}
+#| fig-alt: >
+#|   Line chart showing the number of days between each of Lil’ Bit’s shelter
+#|   visits, plotted against visit number. Most visits are separated by short
+#|   gaps under 50 days, with a dashed blue horizontal line marking the median
+#|   gap of 23 days. One extreme spike appears at visit number 10, representing
+#|   the longest gap of 344 days, highlighted with a green point and label. Red
+#|   points connected by a thin red line show the variation in gap length over
+#|   time, illustrating a pattern of frequent, closely spaced returns with
+#|   occasional long absences.
+#| fig-cap: "Source: Data Provided by City of Austin, Texas - data.austintexas.gov"
+
+# Create cleaned gap dataset:
+# - remove rows with missing values in days_between
+# - assign a visit sequence index (stay_ix) to each record
+gap_df <- lil_bit |>
+  dplyr::filter(!is.na(days_between)) |>
+  dplyr::mutate(stay_ix = dplyr::row_number())
+
+# Calculate key summary values for plotting:
+# - median gap between visits
+# - index and details of the longest gap
+# - total number of visits (for axis scaling)
+median_gap  <- median(gap_df$days_between, na.rm = TRUE)
+long_idx    <- which.max(gap_df$days_between)
+long_point  <- gap_df[long_idx, ]
+n_visits    <- max(gap_df$stay_ix, na.rm = TRUE)
+
+# Define custom colors, background, and axis ranges
+col_line   <- "#2C7BB6"   # deep blue for series
+col_long   <- "#1B9E77"   # green for longest gap
+col_median <- "#E66101"   # orange for median line/text
+bg_fill    <- "#F8FBF9"
+y_lim      <- c(0, 400)   # lock y-axis as you set
+x_max      <- 35          # forces x-axis to end at 40
+
+# Plot gaps between Lil’ Bit’s shelter visits:
+# - Line + points show days between each visit
+# - Highlight the longest gap with a label and marker
+# - Add dashed horizontal line for median gap
+# - Customize axes, labels, title, and theme
+ggplot(gap_df, aes(x = stay_ix, y = days_between)) +
+  geom_line(color = col_line, linewidth = 0.7, alpha = 0.75) +
+  geom_point(color = col_line, size = 2.4) +
+  geom_point(
+    data = long_point,
+    aes(x = stay_ix, y = days_between),
+    color = col_long, size = 4
+  ) +
+  annotate("segment",
+    x = long_point$stay_ix, y = long_point$days_between + 2,
+    xend = long_point$stay_ix, yend = long_point$days_between + 28,
+    color = col_long, linewidth = 0.6
+  ) +
+  annotate("label",
+    x = long_point$stay_ix, y = long_point$days_between + 34,
+    label = paste0(
+      "Longest gap: ", round(long_point$days_between), " days"
+    ),
+    color = col_long, fill = "#EAF6EA", label.size = 0,
+    size = 3, fontface = "bold"
+  ) +
+  geom_hline(
+    yintercept = median_gap, linetype = "dashed",
+    color = col_median, linewidth = 0.5
+  ) +
+  annotate("text",
+    x = x_max - 6, y = median_gap + 70,
+    label = paste0("Median gap: ", round(median_gap), " days"),
+    color = col_median, size = 3, fontface = "bold", hjust = 1
+  ) +
+  annotate("segment",
+    x = x_max - 9, y = median_gap + 50,
+    xend = x_max - 9, yend = median_gap + 8,
+    color = col_median, linewidth = 0.7,
+    arrow = arrow(length = unit(0.05, "in"), type = "closed")
+  ) +
+  scale_x_continuous(
+    limits = c(1, x_max),
+    breaks = seq(0, x_max, by = 5),
+    expand = expansion(mult = c(0.01, 0.04))
+  ) +
+  scale_y_continuous(
+    limits = y_lim,
+    breaks = scales::pretty_breaks(n = 8)
+  ) +
+  labs(
+    title = "Gaps Between Lil’ Bit’s Shelter Visits",
+    subtitle = paste0(
+      "Days between visits with median (23 days) and longest gap (344 days)",
+      " shown"),
+    x = "Visit sequence",
+    y = "Days since last intake",
+    caption = "Data Provided by City of Austin, Texas — data.austintexas.gov"
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.background = element_rect(fill = bg_fill, color = NA),
+    plot.background = element_rect(fill = bg_fill, color = NA),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    plot.subtitle = element_text(
+      hjust = 0.5, size = 9,
+      margin = margin(b = 8)
+    ),
+    axis.title.x = element_text(
+      margin = margin(t = 8), face = "bold",
+      size = 9
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 8), face = "bold",
+      size = 9
+    ),
+    plot.caption = element_text(
+      size = 8, color = "gray40", hjust = 1,
+      margin = margin(t = 10)
+    )
+  )
+```
+
+### 2. Most Common Dog Breeds Returning to the Shelter
+
+When it comes to repeat returns, one group towers above the rest: **Pit Bull Mixes**. Nearly 4,000 of these dogs came back to the Austin Animal Center after adoption or placement, that's almost double the number of the next runner-up, Labrador Retriever Mixes.
+
+After that, the numbers taper off but are still notable. Chihuahua Short-Hair Mixes, German Shepherd Mixes, and purebred Pit Bulls round out the next tier, with each accounting for thousands of returns. The rest of the top ten, breeds like Australian Cattle Dog Mixes, Boxers, and Staffordshire Mixes, still represent hundreds of cases each.
+
+This doesn't seem to be just about breed popularity in Austin. The pattern could reflect deeper challenges:
+
+-   Housing and insurance restrictions that limit where certain breeds can live.
+
+-   Behavioral traits that require more training than many adopters anticipate.
+
+-   Mismatches between dogs and households that only become obvious after the honeymoon period ends.
+
+The data doesn’t tell us the “why” outright, but it does point us toward where to look. If the goal is to cut down repeat returns, these breeds are the logical starting point for targeted outreach, training support, and adoption counseling.
+
+Of course, breed is just one part of the story. Another angle worth exploring is **sex,** not just male versus female, but whether the dogs were intact or already fixed.
+
+```{r}
+#| label: Top 10 Breeds for Repeat Dogs
+#| message: false
+#| warning: false
+#| fig-alt: >
+#|   Horizontal bar chart showing the top 10 dog breeds by frequency in the 
+#|   shelter. Labrador Retriever is the most common breed, followed by Chihuahua 
+#|   Shorthair, Pit Bull Mix, and German Shepherd Mix. The x-axis shows the 
+#|   number of dogs, ranging from 0 to over 2000.
+#| fig-cap: "Source: Source: City of Austin, Texas - data.austintexas.gov"
+
+# Finds out what the top 10 dog breeds are
+dog_repeat |>
+  count(breed_in) |>
+  slice_max(n, n = 10) |>
+  ggplot(aes(x = fct_reorder(breed_in, n), y = n)) +
+  geom_col(fill = "#64B5F6") +
+  coord_flip() +
+  labs(
+    title = "Most Common Dog Breeds with Repeat Returns",
+    subtitle = "Top 10 breeds that came back to the shelter more than once",
+    x = "Dog Breed",
+    y = "Number of Dogs",
+    caption = "Data Provided by City of Austin, Texas - data.austintexas.gov"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle = element_text(
+      hjust = 0.5, margin = margin(b = 10),
+      size = 10
+    ),
+    axis.title.x = element_text(
+      margin = margin(t = 8), size = 9, face = "bold"),
+    axis.title.y = element_text(
+      margin = margin(r = 8), size = 9, face = "bold"),
+    plot.caption = element_text(
+      hjust = 1,
+      size = 8,
+      color = "gray40",
+      margin = margin(t = 15)
+    ),
+    legend.title = element_text(face = "bold", size = 8),
+    legend.text = element_text(size = 8),
+    legend.key.size = unit(1, "lines"),
+    legend.spacing.y = unit(0.5, "cm")
+  )
+```
+
+### 3. Sex and Spay/Neuter Status of Repeat-Return Dogs
+
+When we imagine dogs that keep ending up back at the shelter, the stereotype is usually of intact males roaming the neighborhood looking for a mate. But the numbers tell a different story.
+
+While yes, males do make up the majority of repeat returns, 14,413 (57.5%) compared to 10,637 (42.5%) females, most of them weren’t intact. In fact, nearly two-thirds of the males (8,668 dogs, or 60.1%) were already neutered at intake. Among females, the pattern looks the same: 62% were spayed.
+
+That’s important because it pushes back against a long-standing assumption in sheltering: that mating behavior is the main driver of repeat returns. The data suggests otherwise. Issues like behavior, housing restrictions, or sudden changes in an owner’s life are more likely culprits.
+
+In other words, fixing the animal doesn’t necessarily address the problem.
+
+So far, we’ve looked at who these repeat dogs are. Next, I turned to when they tend to return, to see if any seasonal or historical patterns stood out.
+
+```{r}
+#| fig-alt: >
+#|   Bar chart showing the sex distribution of dogs that returned to the
+#|   Austin Animal Center shelter more than once. The chart displays three
+#|   categories: Female (pink), Male (blue), and Unknown (gray). Males
+#|   represent the largest group of returned dogs, followed by females,
+#|   with a small number of unknown sex.
+#| fig-cap: "Source: Data Provided by City of Austin, Texas -
+#|  data.austintexas.gov"
+#| message: false
+#| warning: false
+
+# Creates a dataframe with the counts of male vs female dogs as well as their proportions of intact vs fixed status
+dog_repeat_sex <- dog_repeat |>
+  mutate(
+    SexSimple = case_when(
+      sex_upon_intake %in% c("Intact Male", "Neutered Male") ~ "Male",
+      sex_upon_intake %in% c("Intact Female", "Spayed Female") ~ "Female",
+      TRUE ~ "Unknown"
+    ),
+    FixStatus = case_when(
+      sex_upon_intake %in% c("Intact Male", "Intact Female") ~ "Intact",
+      sex_upon_intake %in% c("Neutered Male", "Spayed Female") ~ "Fixed",
+      TRUE ~ "Unknown"
+    )
+  ) |>
+  filter(SexSimple != "Unknown", FixStatus != "Unknown") |>
+  count(SexSimple, FixStatus) |>
+  group_by(SexSimple) |>
+  mutate(
+    total_sex = sum(n),
+    pct_within_sex = n / total_sex,
+    label = percent(pct_within_sex, accuracy = 0.1)
+  ) |>
+  ungroup() |>
+  mutate(SexSimple = factor(SexSimple,
+    levels = names(sort(tapply(total_sex, SexSimple, max), decreasing = TRUE))
+  ))
+
+# Review the table of counts for male vs female and the proportion of intact vs
+# fixed
+dog_repeat_sex
+
+dog_repeat_sex |>
+  ggplot(aes(x = SexSimple, y = n, fill = FixStatus)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = label),
+    position = position_stack(vjust = 0.5),
+    color = "white", size = 3.5
+  ) +
+  scale_fill_manual(values = c(
+    "Fixed" = "#2E6F9E",
+    "Intact" = "#9BC4E2"
+  )) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Sex and Spay/Neuter Status of Dogs with Repeat Returns",
+    subtitle = "Comparison of fixed vs. intact males and females",
+    x = "Sex",
+    y = "Number of Dogs",
+    caption = "Data Provided by City of Austin, Texas - data.austintexas.gov"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    axis.title.x = element_text(
+      margin = margin(t = 8), face = "bold", size = 9
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 8), face = "bold", size = 9
+    ),
+    plot.caption = element_text(
+      hjust = 1.35,
+      size = 8,
+      color = "gray40",
+      margin = margin(t = 15)
+    ),
+  )
+```
+
+### 4. Sex Distribution Within the Top 10 Repeat-Return Breeds
+
+In the last section, we saw that most repeat-return dogs were already spayed or neutered, which challenges the idea that intact males are driving the pattern. So the next question is: within the breeds most likely to come back, does one sex tip the scales?
+
+In this chart, the dashed vertical line marks a 50/50 split. Bars leaning further to one side show a stronger skew. For most of the top-return breeds, the skew leans male. Labrador Retrievers, German Shepherds (both purebred and mixes), Pit Bulls, and Australian Cattle Dog mixes all had more male than female returns, with Labs showing the sharpest imbalance.
+
+The one outlier was Staffordshire Mixes, where females actually made up the majority of returns. That tells us sex does play some role, but it’s not a one-size-fits-all story. It’s probably shaped by a mix of breed behavior patterns, adoption preferences, and the general population of dogs coming through the shelter.
+
+With the “who” questions in mind, I then turned to the “when”, looking at whether certain seasons or historical shifts shaped the timing of these returns.
+
+```{r}
+#| fig-alt: >
+#|   Horizontal stacked bar chart showing sex distribution across the top 10
+#|   dog breeds most frequently returned to the shelter more than once. Each bar
+#|   represents one breed, with colored segments showing the proportion of
+#|   returned dogs by sex: blue for male, pink for female, and gray for unknown.
+#|   Most breeds show a near-even distribution between male and female returns,
+#|   with a slight male majority in several breeds such as Labrador Retriever,
+#|   Staffordshire Mix, and Pit Bull. The x-axis represents the percentage of
+#|   returns from 0% to 100%, while the y-axis lists the dog breeds in
+#|   descending order of total returns. A vertical dashed line marks the 50%
+#|   midpoint for visual reference.
+#| fig-cap: "Data Provided by City of Austin, Texas - data.austintexas.gov"
+#| message: false
+#| warning: false
+
+# Filter for returned dogs only
+returned_dogs <- aac_stays |>
+  filter(species == "Dog", !is.na(sex_at_outcome), stay_n > 1)
+
+# Simplify sex into Male / Female / Unknown
+returned_dogs <- returned_dogs |>
+  mutate(sex_grouped = case_when(
+    str_detect(sex_at_outcome, "Male") ~ "Male",
+    str_detect(sex_at_outcome, "Female") ~ "Female",
+    TRUE ~ "Unknown"
+  ))
+
+# Get top 10 breeds
+top_breeds <- returned_dogs |>
+  count(breed_in, name = "total") |>
+  arrange(desc(total)) |>
+  slice_head(n = 10) |>
+  pull(breed_in)
+
+# Filter again to top breeds
+filtered <- returned_dogs |>
+  filter(breed_in %in% top_breeds)
+
+# Create a stacked bar plot
+ggplot(filtered, aes(x = fct_infreq(breed_in), fill = sex_grouped)) +
+  geom_bar(position = "fill", color = "white", linewidth = 0.5) +
+  coord_flip() +
+  geom_hline(
+    yintercept = 0.5, linetype = "dashed", color = "black",
+    linewidth = 0.3
+  ) + # Add line at 50%
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Sex Distribution of Dogs with Repeat Returns by Breed",
+    subtitle = "Top 10 Breeds by Total Returns",
+    x = "Breed",
+    y = "Percentage of Returns",
+    fill = "Sex",
+    caption = "Data Provided by City of Austin, Texas - data.austintexas.gov"
+  ) +
+  scale_fill_manual(values = c(
+    "Female" = "#F28DB2", "Male" = "#5DADE2",
+    "Unknown" = "grey70"
+  )) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle = element_text(
+      hjust = 0.5, margin = margin(b = 10),
+      size = 10
+    ),
+    axis.title.x = element_text(margin = margin(t = 8), size = 9),
+    axis.title.y = element_text(margin = margin(r = 8), size = 9),
+    plot.caption = element_text(
+      hjust = 1.7,
+      size = 8,
+      color = "gray40",
+      margin = margin(t = 15)
+    ),
+    legend.title = element_text(face = "bold", size = 8),
+    legend.text = element_text(size = 8),
+    legend.key.size = unit(1, "lines"),
+    legend.spacing.y = unit(0.5, "cm")
+  )
+
+# Takes a look at the raw numbers for evaluating males vs females ratio
+returned_dogs |>
+  filter(stay_n > 1) |>
+  count(breed_in, sex_grouped) |>
+  arrange(desc(n))
+```
+
+### 5. Monthly Repeat Dog Intakes at Austin Animal Center
+
+This heatmap tracks how many repeat-intake dogs came into the Austin Animal Center each month from 2014 through 2024. (I omitted both 2013 and 2025 because of incomplete data).
+
+How to read this chart:
+
+-   Each row is a year; each column is a month.
+
+-   Darker shades mean fewer repeat intakes; lighter, hotter shades mean more.
+
+-   Look for horizontal bands (seasonal patterns) or sudden shifts (events or disruptions).
+
+**What the data shows\
+**Before 2020, strong seasonal cycles appeared, with repeat returns peaking in late spring and summer (April–July). These surges likely align with "relocation season", when leases turn over, schools let out, and families are more likely to move. Moves often bring housing restrictions or disruptions that can force pet returns.
+
+In 2020, the pattern broke sharply: repeat intakes dropped across nearly every month. This coincides with the COVID-19 pandemic, when shutdowns, higher adoption rates, and expanded fostering programs kept many dogs out of the shelter.
+
+By 2021–2023, intakes began to rebound, suggesting some “pandemic pets” were eventually returned. Even so, the most recent years (2023–2024) remain below the pre-pandemic highs of 2017–2019, possibly reflecting improved adoption screening, owner support, or changes in shelter policies.
+
+This monthly view highlighted two things clearly: consistent pre-pandemic peaks and a dramatic COVID-era dip. But one finding kept resurfacing in earlier analyses: neutered males consistently make up the largest share of repeat intakes. That made them worth a closer look.
+
+```{r}
+#| fig-alt: >
+#|   Heatmap showing monthly repeat dog intakes at Austin Animal Center from
+#|   January 2014 to June 2025. The x-axis lists months from January to December,
+#|   while the y-axis lists years from 2014 through 2024. Each square represents
+#|   the number of repeat intakes in a given month, shaded from dark purple
+#|   (fewer intakes, around 40) to bright yellow (higher intakes, over 160).
+#|   Years 2017–2019 show consistently high volumes, with the brightest yellow
+#|   cells concentrated in summer months. A sharp decline in 2020 is annotated
+#|   as "COVID drop," followed by several years of much lower intake levels.
+#|   Recent years (2021–2024) remain in darker purple shades, indicating fewer
+#|   monthly repeat intakes compared to the pre-COVID period.
+#| fig-cap: "Data Provided by City of Austin, Texas - data.austintexas.gov"
+#| fig-width: 8
+#| fig-asp: 0.92
+
+# Prep ---------------------------------------------------------------
+
+monthly_totals <- returned_dogs |>
+  mutate(
+    date_intake = as_date(datetime_intake),
+    year  = year(date_intake),
+    month = month(date_intake, label = TRUE)
+  ) |>
+  count(year, month)
+
+# keep full years only
+monthly_totals_clean <- monthly_totals |>
+  filter(year >= 2014, year <= 2024, !is.na(month))
+
+# y-position of the 2020 row (because y is a factor)
+year_levels <- levels(factor(monthly_totals_clean$year))
+covid_y     <- which(year_levels == "2020")
+
+# Add a dynamic text color column
+monthly_totals_clean <- monthly_totals_clean |>
+  mutate(
+    label_color = ifelse(n > 120, "black", "white") # adjust cutoff as needed
+  )
+
+# Heatmap with dynamic label colors
+ggplot(monthly_totals_clean, aes(x = month, y = factor(year), fill = n)) +
+  geom_tile(color = "white") +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  geom_text(aes(
+    label = ifelse(n > 180 | n < 50, n, ""), color = label_color
+  ), size = 2.5) +
+  scale_color_identity() + # makes geom_text respect your label_color column
+  scale_fill_viridis_c(name = "Intakes", option = "mako") +
+  labs(
+    title = "Monthly Repeat Dog Intakes",
+    subtitle = "Austin Animal Center, 2014–2024 (lighter cells = more intakes)",
+    x = "Month",
+    y = "Year",
+    caption = "Data Provided by City of Austin, Texas - data.austintexas.gov"
+  ) +
+  annotate("text",
+    x = 2, y = 7, label = "COVID drop",
+    color = "white", size = 3, fontface = "bold"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+    plot.subtitle = element_text(
+      hjust = 0.5, margin = margin(b = 10), size = 9
+    ),
+    axis.title.x = element_text(
+      margin = margin(t = 10), face = "bold", size = 9
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 10), face = "bold", size = 9
+    ),
+    plot.caption = element_text(
+      size = 8, hjust = 1.25, margin = margin(t = 18), color = "gray40"
+    ),
+    legend.title = element_text(size = 9, face = "bold"),
+    legend.text = element_text(size = 8)
+  )
+```
+
+------------------------------------------------------------------------
+
+## Part 2: Neutered Males
+
+In Part 1, we saw that male dogs make up a bigger share of repeat returns than females, and most of them were already neutered. That alone challenges the stereotype that intact males are the main culprits behind repeat visits. To dig deeper, I looked at how these neutered males were coming back to the shelter.
+
+### 1. Why Neutered Males Return Multiple Times
+
+**Owner-driven returns** stood out as the single biggest factor. Almost half (47.4%) of repeat intakes for neutered males were **owner surrenders**, cases where the owner brought the dog back themselves. The data doesn’t give exact reasons, but it likely includes things like housing restrictions, financial struggles, changes in family circumstances, or behavior issues that proved too much to handle.
+
+**Stray intakes** made up another 39.6% of cases, where neutered males were picked up roaming and returned by a member of the public. A smaller share (12.3%) came in through “public assist” cases, where animal control or another city agency had to step in. The last 0.8% fell into “other” categories too uncommon to analyze.
+
+Taken together, the numbers show that neutered males aren’t just escape artists, they’re often repeat visitors because of their owners’ circumstances or decisions. Without detailed “intake subtypes” we can’t know the exact why, but the categories point more toward human factors than the dogs themselves.
+
+```{r}
+#| label: why-nm-return
+#| fig-alt: > 
+#|   Horizontal bar chart titled "Why Neutered Males Return to the Shelter." 
+#|   The x-axis shows percent of repeat intakes, while the y-axis lists intake 
+#|   types. Owner Surrender accounts for about 47%, Stray about 39%, Public 
+#|   Assist about 12%, and Other less than 2%. Bars for Owner Surrender and 
+#|   Stray are the longest, indicating these are the leading reasons neutered 
+#|   males return to the shelter.
+#| fig-cap: "Data Provided by City of Austin, Texas — data.austintexas.gov"
+
+# Creates a summary table of intake type counts and their proportions
+neutered_males_summary <- dog_repeat |>
+  filter(sex_upon_intake == "Neutered Male") |>
+  mutate(
+    intake_type = if_else(is.na(intake_type), "Unknown", intake_type),
+    intake_type = case_when(
+      intake_type %in% c(
+        "Abandoned",
+        "Euthanasia Request",
+        "Unknown"
+      ) ~ "Other",
+      TRUE ~ intake_type
+    )
+  ) |>
+  count(intake_type, name = "n") |>
+  mutate(
+    pct = n / sum(n),
+    label = paste0(percent(pct, accuracy = 0.1), " (n=", comma(n), ")")
+  ) |>
+  arrange(pct)
+
+# Review the summary table
+neutered_males_summary 
+
+# total N for subtitle (prevents error in Quarto rendering)
+n_total <- sum(neutered_males_summary$n, na.rm = TRUE)
+
+# Creates bar plot showing the counts for each type of intake
+plot_df <- neutered_males_summary |>
+  dplyr::arrange(dplyr::desc(pct)) |>
+  dplyr::mutate(intake_type = forcats::fct_reorder(intake_type, pct))
+
+ggplot(plot_df, aes(x = pct, y = intake_type)) +
+  geom_col(fill = "#A8E6CF", width = 0.65) +
+  geom_text(aes(label = label), hjust = -0.05, size = 3.2, color = "gray20") +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 0.50),
+    breaks = seq(0, 0.50, by = 0.10),
+    expand = expansion(mult = c(0, 0.08))
+  ) +
+  labs(
+    title = "Repeat Intakes of Neutered Males by Intake Type",
+    subtitle = paste0(
+      "Austin Animal Center, 2013–2025 (n = ",
+      scales::comma(n_total), ")"
+    ),
+    x = "Percent of repeat intakes",
+    y = "Intake type",
+    caption = "Data Provided by City of Austin, Texas — data.austintexas.gov"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    plot.subtitle = element_text(
+      hjust = 0.5, size = 9, margin = margin(b = 8)
+    ),
+    axis.title.x = element_text(
+      margin = margin(t = 8), face = "bold", size = 9
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 8), face = "bold", size = 9
+    ),
+    plot.caption = element_text(
+      size = 8, color = "gray40", hjust = 1, margin = margin(t = 12)
+    )
+  )
+```
+
+### 2. Where Neutered Male Dogs End Up After Returning to the Shelter
+
+After flagging neutered males as the largest group of repeat-intake dogs, I looked at what happened each time they left the shelter.
+
+The most common outcome was adoption, making up nearly half of all cases (46.8% or 4,358 dogs). Another 31.8% (2,962 dogs) were reclaimed by their original owners. Transfers to partner rescues or organizations accounted for 12.1% (1,126 dogs).
+
+Most dogs left the shelter alive, but not every story ended that way:
+
+-   Euthanasia: 1.7% (157 dogs), usually for behavioral or medical reasons.
+
+-   No Outcome Recorded: 0.5% (49 dogs).
+
+-   Died in Care: 0.1% (11 dogs).
+
+-   Died (Disposal): 0.04% (4 dogs).
+
+-   Missing: \<0.01% (1 dog).
+
+These numbers tell us the big picture, but outcomes often depend on how a dog came back, whether as an owner surrender, a stray, or through another path. So next, I broke outcomes down by intake type to see if the story changes depending on how the dog re-entered the system.
+
+```{r}
+#| label: repeat-nm-outcomes
+#| fig-alt: >
+#|   Horizontal bar chart showing outcomes for neutered male dogs after repeat 
+#|   intakes at the shelter. Adoption is the most frequent outcome with over 
+#|   4,000 cases. Return to Owner follows at just under 3,000, and Transfers 
+#|   account for around 1,200 cases. Euthanasia totals 157 cases, while less 
+#|   common outcomes include No Outcome Recorded (49), Died (11), Died by 
+#|   Disposal (4), and Missing (1). The chart emphasizes that most repeat-intake 
+#|   neutered male dogs are either adopted, returned to their owners, or 
+#|   transferred, with euthanasia and other outcomes being rare.
+#| fig-cap: "Data Provided by City of Austin, Texas — data.austintexas.gov"
+
+# Create dataframe with only repeat intakes that are neutered males
+repeat_neutered_males <- dog_repeat |>
+  filter(sex_upon_intake == "Neutered Male")
+
+# Recodes outcome types into easier to understand labels
+repeat_neutered_males <- repeat_neutered_males |>
+  mutate(outcome_type = case_when(
+    outcome_type %in% c("Adoption", "Rto-Adopt") ~ "Adoption",
+    outcome_type == "Return to Owner" ~ "Return to Owner",
+    outcome_type == "Transfer" ~ "Transfer",
+    outcome_type == "Euthanasia" ~ "Euthanasia",
+    outcome_type == "Died" ~ "Died",
+    outcome_type == "Disposal" ~ "Died (Disposal)",
+    outcome_type == "Missing" ~ "Missing",
+    is.na(outcome_type) ~ "No Outcome Recorded",
+    TRUE ~ "Other"
+  ))
+
+# Recodes outcome subtypes into easier to understand labels
+repeat_neutered_males <- repeat_neutered_males |>
+  mutate(outcome_subtype = case_when(
+    outcome_subtype %in% c("Medical", "Suffering") ~ "Medical/Suffering",
+    outcome_subtype %in% c("Aggressive", "Behavior") ~ "Behavior/Aggression",
+    outcome_subtype == "Partner" ~ "Transfer – Partner",
+    outcome_subtype == "Foster" ~ "Foster Placement",
+    outcome_subtype == "Offsite" ~ "Offsite Event",
+    outcome_subtype == "Field" ~ "Field Outcome",
+    outcome_subtype == "Court/Investigation" ~ "Court or Investigation",
+    outcome_subtype == "Rabies Risk" ~ "Rabies Risk",
+    outcome_subtype == "Out State" ~ "Out-of-State Transfer",
+    outcome_subtype %in% c("In Foster", "In Kennel") ~ "In Care",
+    outcome_subtype == "Prc" ~ "Partner Rescue Coordination",
+    outcome_subtype == "At Vet" ~ "At Veterinary Partner",
+    outcome_subtype == "Possible Theft" ~ "Possible Theft",
+    outcome_subtype == "Emergency" ~ "Emergency Outcome",
+    is.na(outcome_subtype) ~ "No Subtype Recorded",
+    TRUE ~ "Other"
+  ))
+
+# Get counts for each outcome type
+repeat_nm_outcome <- repeat_neutered_males |>
+  mutate(outcome_type = coalesce(outcome_type, "Other")) |>
+  count(outcome_type, name = "n") |>
+  arrange(n) |>
+  mutate(outcome_type = factor(outcome_type, levels = outcome_type))
+
+# Plot the breakdown of outcomes for repeat intakes
+ggplot(repeat_nm_outcome, aes(x = n, y = outcome_type)) +
+  geom_col(fill = "#A8E6CF") +
+  geom_text(
+    data = ~ dplyr::filter(.x, n <= 1000),
+    aes(label = scales::comma(n)),
+    hjust = -0.1,
+    size = 2.8,
+    fontface = "bold",
+    color = "#00796B"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.10))) +
+  labs(
+    title = "Outcomes for Neutered Male Dogs with Repeat Intakes",
+    subtitle = paste0(
+      "Austin Animal Center, 2013–2025 (n = ",
+      scales::comma(n_total), ")"
+    ),
+    x = "Number of Dog Outcomes",
+    y = "Outcome Type",
+    caption = "Data Provided by City of Austin, Texas — data.austintexas.gov"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle = element_text(
+      hjust = 0.5, margin = margin(b = 10),
+      size = 10
+    ),
+    axis.title.x = element_text(
+      margin = margin(t = 8), size = 9, face = "bold"
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 8), size = 9, face = "bold"
+    ),
+    plot.caption = element_text(
+      hjust = 1, size = 8, color = "gray40",
+      margin = margin(t = 15)
+    )
+  )
+```
+
+### 3. What’s behind the negative outcomes?
+
+Breaking outcomes into subtypes gives us a sharper picture.
+
+-   **Transfers:** Nearly all went to partner rescues (95.6%, or 1,076 dogs), with a smaller share to out-of-state partners (4.4%, or 50 dogs).
+
+-   **Foster:** 589 dogs were placed in foster homes, often a stepping stone toward adoption.
+
+-   **Euthanasia:** The majority were for behavioral or aggression-related reasons (103 cases, 65.6%). Another 32 cases (20.4%) were due to medical issues or suffering.
+
+This means nearly 9 in 10 neutered male repeat-intake dogs eventually leave the shelter alive, most through adoption or reunification. But the small fraction facing life-ending outcomes points to clear pressure points: behavior support, medical care, and adoption matching. Strengthening these areas could help reduce the cycle of returns and improve long-term outcomes.
+
+```{r}
+repeat_nm_subtype <- repeat_neutered_males |>
+  mutate(outcome_subtype = coalesce(outcome_subtype, "Other")) |>
+  count(outcome_subtype, name = "n") |>
+  arrange(desc(n)) |>
+  mutate(outcome_subtype = factor(outcome_subtype, levels = outcome_subtype))
+
+repeat_nm_subtype
+```
+
+```{r}
+#| fig-alt: >
+#|   Horizontal bar chart showing subtypes of negative outcomes among
+#|   repeat-intake neutered male dogs at Austin Animal Center. The x-axis shows
+#|   the number of dogs, and the y-axis lists outcome subtypes. The most common
+#|   is Behavior/Aggression (just over 100 dogs), followed by Medical/Suffering
+#|   (around 35 dogs). Other smaller categories include No Subtype Recorded,
+#|   In Care, Court or Investigation, Rabies Risk, At Veterinary Partner,
+#|   Possible Theft, and Emergency Outcome, each with fewer than 20 cases. Bar
+#|   colors indicate outcome type: dark green for Euthanasia, teal for Died,
+#|   pale green for Missing, and light green for No Outcome Recorded. The chart
+#|   highlights that behavior and medical issues drive most euthanasia
+#|   decisions among repeat-intake neutered males.
+#| fig-cap: "Data Provided by City of Austin, Texas – data.austintexas.gov"
+
+
+# Filter for negative outcomes only
+negative_patterns <- repeat_neutered_males |>
+  filter(outcome_type %in% c("Euthanasia", "Died", "Missing", "No Outcome")) |>
+  group_by(outcome_type, outcome_subtype) |>
+  summarise(count = n(), .groups = "drop") |>
+  arrange(desc(count))
+
+# View the table
+negative_patterns
+
+# Creates list of levels to use for filter
+neg_levels <- c("Euthanasia", "Died", "Missing", "No Outcome Recorded")
+
+# Creates dataframe cross-tabbing outcome types and subtypes counts
+negative_patterns <- repeat_neutered_males |>
+  dplyr::filter(outcome_type %in% neg_levels) |>
+  dplyr::count(outcome_type, outcome_subtype, name = "n") |>
+  dplyr::arrange(desc(n)) |>
+  dplyr::mutate(outcome_subtype = forcats::fct_reorder(outcome_subtype, n))
+
+# Creates a Horizontal bar chart of cross tabs
+ggplot(
+  negative_patterns,
+  aes(x = n, y = outcome_subtype, fill = outcome_type)
+) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = c(
+    "Euthanasia" = "#2e7d71",
+    "Died" = "#6fb9ab",
+    "Missing" = "#9fd4ca",
+    "No Outcome Recorded" = "#cfeae4"
+  )) +
+  labs(
+    title = 
+      "Causes of Negative Outcomes for Neutered Male Dogs with Repeat Intakes",
+    subtitle =
+      "Behavior and medical suffering drive most euthanasia cases",
+    x = "Number of dogs",
+    y = "Outcome subtype",
+    fill = "Outcome type",
+    caption = "Data Provided by City of Austin, Texas — data.austintexas.gov"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle = element_text(
+      hjust = 0.5, margin = margin(b = 10),
+      size = 10
+    ),
+    axis.title.x = element_text(
+      margin = margin(t = 8), size = 9, face = "bold"
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 8), size = 9, face = "bold"
+    ),
+    plot.caption = element_text(
+      hjust = 3.7, size = 8, color = "gray40",
+      margin = margin(t = 15)
+    ),
+    legend.title = element_blank()
+  )
+```
+
+```{r}
+#| fig-alt: >
+#|   Horizontal stacked bar chart showing the proportional breakdown of negative
+#|   outcomes for repeat-intake neutered male dogs. Each bar represents an
+#|   outcome type—Euthanasia, Died, Missing, or No Outcome Recorded—with segments
+#|   showing outcome subtypes. For euthanasia, behavior/aggression accounts for
+#|   the majority, followed by medical/suffering and smaller portions for court
+#|   or investigation, rabies risk, and at veterinary partner. For "died," most
+#|   cases are labeled "in care" or medical/suffering. For "missing," almost all
+#|   cases lack a specific subtype. For "no outcome recorded," the bar is fully
+#|   filled with "no subtype recorded." The x-axis shows proportions from 0% to
+#|   100%, the y-axis lists outcome types.
+#| fig-cap: "Data Provided by City of Austin, Texas - data.austintexas.gov"
+
+# Define the outcome types to include
+neg_levels <- c("Euthanasia", "Died", "Missing", "No Outcome Recorded")
+
+# Summarize and compute proportions within each outcome_type
+neg_props <- repeat_neutered_males |>
+  filter(outcome_type %in% neg_levels, !is.na(outcome_subtype)) |>
+  count(outcome_type, outcome_subtype, name = "n") |>
+  group_by(outcome_type) |>
+  mutate(prop = n / sum(n)) |>
+  ungroup() |>
+  mutate(outcome_type = factor(outcome_type, levels = neg_levels)) |>
+  mutate(outcome_subtype = fct_reorder(outcome_subtype, n, .fun = sum))
+
+# Creates stacked bar plot
+ggplot(
+  neg_props,
+  aes(x = outcome_type, y = prop, fill = outcome_subtype)
+) +
+  geom_col(width = 0.75, color = NA) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_brewer(palette = "GnBu") + # auto pastel palette
+  labs(
+    title = "Subtypes of Negative Outcomes for Shelter Dogs",
+    subtitle = "Most euthanasia cases linked to behavior or medical suffering",
+    x = "Outcome Type",
+    y = "Proportion of cases",
+    fill = "Outcome subtype",
+    caption = "Data Provided by City of Austin, Texas — data.austintexas.gov"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    axis.title.x = element_text(
+      margin = margin(t = 9), face = "bold", size = 8
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 9), face = "bold", size = 8
+    ),
+    legend.position = "right",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8),
+    plot.caption = element_text(hjust = 3.2, size = 8)
+  )
+```
+
+```{r}
+#| fig-alt: >
+#|   Horizontal bar chart showing euthanasia subtypes among repeat-intake
+#|   neutered male dogs at Austin Animal Center. Behavior/Aggression is the
+#|   leading subtype, with just over 100 dogs. Medical/Suffering follows at
+#|   around 35 dogs. Other categories include Court or Investigation,
+#|   Rabies Risk, and At Veterinary Partner, each with fewer than 15 dogs.
+#|   A small number of cases were recorded without a subtype. The x-axis
+#|   represents the number of dogs, while the y-axis lists the euthanasia
+#|   subtypes.
+#| fig-cap: "Data Provided by City of Austin, Texas - data.austintexas.gov"
+#|
+
+# Creates simple count bar plot of euthanasia subtypes
+negative_patterns |>
+  dplyr::filter(outcome_type == "Euthanasia") |>
+  ggplot(aes(n, outcome_subtype)) +
+  geom_col(fill = "#6fb9ab", width = 0.7) +
+  labs(
+    title = "Subtypes of Euthanasia Outcomes for Neutered Male Dogs",
+    subtitle = 
+      paste0("Most cases were linked to behavior/aggression, ",
+      "followed by medical suffering."),
+    x = "Number of dogs",
+    y = "Subtype",
+    caption = "Data Provided by City of Austin, Texas - data.austintexas.gov"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle = element_text(
+      hjust = 0.5, margin = margin(b = 10), size = 10
+    ),
+    axis.title.x = element_text(
+      margin = margin(t = 8), size = 8, face = "bold"
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 8), size = 8, face = "bold"
+    ),
+    plot.caption = element_text(
+      hjust = 1, size = 8, color = "gray40",
+      margin = margin(t = 15)
+    )
+  )
+```
+
+### 4. Outcomes by Intake Reason: Neutered Males
+
+This chart compares what happened to neutered male dogs after returning to the shelter, split into two groups: owner surrenders and non–owner surrenders (strays or public assist).
+
+-   **Owner Surrenders:** Most were rehomed (74.3% were adopted). Transfers made up 18.7%, while just 4.0% were reunited with their original owner. Euthanasia occurred in 2.0%.
+
+-   **Non–Owner Surrenders:** The majority (61.4%) were reclaimed by their families. Adoption followed at 28.6%, then transfers at 7.8%. Euthanasia occurred in 1.6%.
+
+Owner-surrendered dogs tend to move on through adoption, while non–owner surrenders are most often reunited with their original families. In both groups, euthanasia remains rare but slightly more frequent among owner surrenders.
+
+```{r}
+#| fig-alt: >
+#|   Horizontal bar chart comparing outcomes of repeat-intake neutered male dogs
+#|   by intake reason: Owner Surrender versus Non–Owner Surrender. Bars show
+#|   absolute counts, with percentage labels for each outcome category. Adoption
+#|   is the most common outcome, representing 74.3% of Owner Surrenders and
+#|   28.6% of Non–Owner Surrenders. Return to Owner is more frequent for
+#|   Non–Owner Surrenders (61.4%) than Owner Surrenders (4.0%). Transfers occur
+#|   in 18.7% of Owner Surrenders and 7.8% of Non–Owner Surrenders. Euthanasia
+#|   is relatively rare (2.0% and 1.6%), while all other outcomes combined are
+#|   collapsed into an “Other” category (<1% each). The x-axis represents the
+#|   number of dog outcomes, and the y-axis lists outcome types ordered by
+#|   prevalence.
+#| fig-cap: "Source: Data Provided by City of Austin, Texas - data.austintexas.gov"
+
+
+# Build the raw comparison table (before collapsing)
+cmp_nm_raw <- repeat_neutered_males |>
+  mutate(
+    intake_group = if_else(intake_type == "Owner Surrender",
+      "Owner Surrender", "Non–Owner Surrender"
+    ),
+    outcome_type = coalesce(outcome_type, "No Outcome Recorded")
+  ) |>
+  count(intake_group, outcome_type, name = "n")
+
+# Collapse tiny outcomes into "Other" and recompute percents
+others_vec <- c(
+  "Missing", "Died (Disposal)", "Died",
+  "No Outcome Recorded", "Died / No Outcome Recorded"
+)
+
+cmp_nm <- cmp_nm_raw |>
+  mutate(outcome_type = if_else(outcome_type %in% others_vec, "Other",
+    outcome_type
+  )) |>
+  group_by(intake_group, outcome_type) |>
+  summarise(n = sum(n), .groups = "drop") |>
+  group_by(intake_group) |>
+  mutate(
+    pct   = n / sum(n),
+    label = scales::percent(pct, accuracy = 0.1)
+  ) |>
+  ungroup() |>
+  mutate(
+    outcome_type = factor(outcome_type,
+      levels = c(
+        "Adoption", "Return to Owner", "Transfer", "Euthanasia",
+        "Other"
+      )
+    )
+  )
+
+# Creates Side-by-side bar chart (counts on the x-axis; percent labels on bars)
+ggplot(cmp_nm, aes(x = n, y = outcome_type, fill = intake_group)) +
+  geom_col(position = position_dodge(width = 0.9)) +
+  geom_text(aes(label = label),
+    position = position_dodge(width = 0.9),
+    hjust = -0.05, size = 3.2
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_manual(
+    values = c(
+      "Owner Surrender"     = "#A8E6CF",
+      "Non–Owner Surrender" = "#80CBC4" 
+    )
+  ) +
+  labs(
+    title = "Outcomes for Repeat Intake Neutered Males",
+    subtitle = paste(
+    "Comparing Owner vs. Non-Owner Surrenders at Austin Animal Center",
+    "(2013–2025)"),
+    x = "Number of Dog Outcomes",
+    y = "Outcome Type",
+    caption =
+      "Data Provided by City of Austin, Texas - data.austintexas.gov",
+    fill = NULL
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    axis.title.x = element_text(
+      margin = margin(t = 8), size = 9, face = "bold"
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 8), size = 9, face = "bold"
+    ),
+    plot.caption = element_text(
+      hjust = 3.75, size = 8, color = "gray40",
+      margin = margin(t = 15)
+    ),
+    legend.position = "right",
+    legend.text = element_text(size = 8)
+  )
+
+# Creates transparency table: what’s inside "Other" (by intake group)
+other_breakdown <- cmp_nm_raw |>
+  filter(outcome_type %in% others_vec) |>
+  arrange(intake_group, outcome_type)
+
+other_breakdown
+```
+
+### 5. Most Common Breeds in Repeat Neutered Male Dog Intakes
+
+After looking at outcomes, the next question is which breeds dominate this group of repeat-intake neutered males.
+
+Again, **Pit Bull Mixes** stand out by a wide margin, with more than 300 repeat intakes, nearly double the number of Labrador Retriever Mixes, the next most common breed. Behind them are Chihuahua Shorthair Mixes and German Shepherd Mixes, though their numbers are far smaller compared to Pit Bull Mixes.
+
+This skew matters because when one or two breeds dominate, their outcomes shape the overall picture. If Pit Bulls are returned more often, then their adoption, transfer, or euthanasia rates weigh heavily on the shelter’s statistics. It also raises the possibility that breed-specific barriers, like housing restrictions, behavioral expectations, or adopter mismatches, are at play.
+
+This means that the over representation of a few breeds means that targeted adoption counseling, breed-specific support, or community education could make a measurable impact on reducing repeat returns.
+
+```{r}
+#| fig-alt: >
+#|   Horizontal bar chart showing the top 10 breeds of repeat-intake neutered
+#|   male dogs at the Austin Animal Center. Each bar represents one breed, 
+#|   ordered from most to least frequent. Pit Bull Mix leads with over 300 
+#|   dogs, followed by Labrador Retriever Mix (~230), Chihuahua Shorthair Mix 
+#|   (~130), and German Shepherd Mix (~105). The remaining breeds—Pit Bull, 
+#|   Boxer Mix, Australian Cattle Dog Mix, German Shepherd, Labrador Retriever, 
+#|   and American Bulldog Mix—each have fewer than 100 dogs. Bars are colored 
+#|   light mint green, with the x-axis showing the number of dogs and the 
+#|   y-axis listing breed names. The chart title and subtitle highlight that 
+#|   Pit Bull Mixes have nearly double the count of most other breeds.
+#| fig-cap: "Source: Data Provided by City of Austin, Texas - data.austintexas.gov"
+
+# Count visits per neutered male (per dog & breed), keep repeat visitors only
+visits_per_nm <- repeat_neutered_males |>
+  group_by(animal_id, breed_in) |>
+  summarise(total_visits = n(), .groups = "drop") |>
+  filter(total_visits > 1)
+
+# Finds top breeds by number of distinct dogs (among repeat neutered males)
+top_breeds_neutered_males <- visits_per_nm |>
+  group_by(breed_in) |>
+  summarise(dog_count = n_distinct(animal_id), .groups = "drop") |>
+  arrange(desc(dog_count))
+
+# Plots top 10 breeds
+top_breeds_neutered_males |>
+  slice_max(order_by = dog_count, n = 10) |>
+  ggplot(aes(x = reorder(breed_in, dog_count), y = dog_count)) +
+  geom_col(fill = "#A8E6CF") +
+  coord_flip() +
+  labs(
+    title = "Top Breeds of Repeat Neutered Males",
+    subtitle = paste0("Pit Bull Mixes lead by a wide margin, nearly doubling",
+                      "the next highest breed."),
+    x = "Dog Breed",
+    y = "Number of Dogs",
+    caption =
+      "Source: Data Provided by City of Austin, Texas - data.austintexas.gov"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle = element_text(
+      hjust = 0.5, margin = margin(b = 10),
+      size = 9
+    ),
+    axis.title.x = element_text(
+      margin = margin(t = 8), face = "bold",
+      size = 9
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 8), face = "bold",
+      size = 9
+    ),
+    plot.caption = element_text(
+      hjust = 1, size = 8, color = "gray40",
+      margin = margin(t = 15)
+    )
+  )
+```
+
+# Conclusion & Implications
+
+This analysis of repeat dog intakes at the Austin Animal Center shows that while most dogs return only once, a smaller but important subset (especially neutered males) cycle back multiple times. Breeds such as Pit Bull Mixes, Labrador Retriever Mixes, and Chihuahua Shorthair Mixes are disproportionately represented, which means their outcomes weigh heavily on the shelter’s overall trends. Intake reason also matters: owner surrenders are most often rehomed through adoption, while non–owner surrenders are more often reunited with their families. Seasonal peaks before 2020, the sharp pandemic drop, and slower rebounds afterward suggest that community behavior and shelter operations strongly shape return patterns.
+
+## Critical Reflection
+
+This project really challenged some of the usual assumptions about why dogs keep coming back to shelters. I honestly expected intact males to dominate the repeat-intake group, but the data showed something else entirely: neutered males actually made up the *largest* share. That shifted my perspective and made it clear that returns are often less about the dog’s biology and more about human factors like housing restrictions, financial struggles, or adopters feeling overwhelmed.
+
+Linking intakes and outcomes at the individual dog level was another eye-opener. Instead of just seeing totals, I could actually follow dogs through multiple visits, which revealed patterns I wouldn’t have noticed otherwise. The biggest one was the split between owner surrenders and non-owner surrenders (owners bringing dogs back themselves vs. dogs being found as strays). That difference shaped outcomes in big ways.
+
+Of course, the dataset had limits. The “owner surrender” category doesn’t tell us whether someone gave up their dog because of money, housing, or behavior. “Adoption” just tells us the dog left with someone new, not whether the placement stuck. Bigger context, like breed restrictions in housing or local eviction rates, is also missing, even though those things probably play a huge role. And because this is just one city shelter, the results can’t be applied to every type of shelter, especially limited-intake ones.
+
+Working through these gaps made me think more about ethics in shelter data. It’s easy to point to breed patterns, but that can reinforce stereotypes if you don’t acknowledge the bigger picture of adopter bias, housing discrimination, and systemic barriers. It also matters that the dataset was de-identified, it's less detail to work with but a necessary trade off to protect people’s privacy.
+
+In the end, this project gave me stronger technical skills and a better sense of how messy real-world data connects to animal welfare. It also left me with new questions: how age affects repeat returns, how community-level issues like poverty and housing impact intakes, and what kinds of support actually help keep dogs in homes. Those are the kinds of things I’d want to dig into next, since they’d make future research more useful not just for shelters, but for adopters and especially for the sweet pups who end up back in the system.
+
+------------------------------------------------------------------------
+
+# References
+
+ASPCA. (2024). Pet statistics. ASPCA. <https://www.aspca.org/helping-shelters-people-pets/us-animal-shelter-statistics>
+
+City of Austin, Texas. (2025). Austin Animal Center intake and outcome data (2013–2025) \[Data set\]. City of Austin Open Data Portal. <https://data.austintexas.gov>
+
+Grolemund, G., & Wickham, H. (2017). R for data science: Import, tidy, transform, visualize, and model data. O’Reilly Media.
+
+Hawes, S. M., Kerrigan, J. M., & Morris, K. N. (2020). Factors informing outcomes for older cats and dogs in animal shelters. Animals, 10(5), 746. <https://doi.org/10.3390/ani10050746>
+
+Long, J. D. (2019). R cookbook: Proven recipes for data analysis, statistics, and graphics (2nd ed.). O’Reilly Media.
+
+Miller, J. E. (2005). The Chicago guide to writing about multivariate analysis. University of Chicago Press.
+
+Patronek, G. J., Glickman, L. T., Beck, A. M., McCabe, G. P., & Ecker, C. (1996). Risk factors for relinquishment of dogs to an animal shelter. Journal of the American Veterinary Medical Association, 209(3), 572–581. <https://pubmed.ncbi.nlm.nih.gov/8755975/>
+
+R Core Team. (2025). R: A language and environment for statistical computing. R Foundation for Statistical Computing. <https://www.R-project.org>
+
+------------------------------------------------------------------------
+
+# Appendix
+
+## Data Source & Preparation Information
+
+This appendix documents the main data cleaning and wrangling steps used to prepare the Austin Animal Center intake and outcome records for analysis. These details are included so that other data scientists can evaluate or replicate the approach.
+
+**Data Source**
+
+-   [**Austin Animal Center Intake and Outcome Data (2013–2025)**](https://data.austintexas.gov/browse?q=animal&sortBy=relevance&page=1&pageSize=20), retrieved from the City of Austin Open Data Portal.
+
+-   Intake and outcome records were provided as separate tables and joined during preprocessing.
+
+**Data Cleaning and Transformation**
+
+1.  Date Conversion
+
+    -   Intake and outcome datetime fields were converted to Date objects for easier aggregation
+
+2.  Stay Number Assignment
+
+    -   Because animals may enter the shelter multiple times, each visit was assigned a sequential stay number.
+
+    -   This ensured that outcomes were linked to the correct intake event.
+
+3.  Dataset Join
+
+    -   Intake and outcome datasets were joined using a combination of animal_id and stay_number
+
+    -   This created a single record per animal visit that included both intake context and outcome.
+
+4.  Species Filtering
+
+    -   The dataset was filtered to include dogs only, excluding cats and other animals.
+
+5.  Repeat Visitors
+
+    -   A repeat visitor indicator was created to flag animals with more than one intake.
+
+    -   Analyses in this project focused on dogs with repeat visits.
+
+6.  Variable Recoding
+
+    -   Intake Type was simplified into two categories:
+
+        -   Owner surrender • Non-owner surrender (stray, public assist, confiscation, etc.)
+
+        -   Outcome Type was grouped into broader categories for interpretability:
+
+            -   Adoption
+
+            -   Return to Owner
+
+            -   Transfer
+
+            -   Euthanasia
+
+            -   Other (missing, died in care, etc.)
+
+7.  Handling Missing or Ambiguous Data
+
+    -   Intake age was complete, so no imputation was required.
+
+    -   A small number of cases with missing outcome types were retained and coded as “No Outcome Recorded.”
+
+**Tools Used**
+
+The analysis was conducted in R (version 4.4.0) using the following packages:
+
+-   `dplyr` – data manipulation • tidyr – reshaping data (wide ↔ long)
+
+-   `lubridate` – working with dates/times • readr – reading CSV and other flat files
+
+-   `forcats` – handling categorical variables
+
+-   `stringr` – string/text operations
+
+-   `here` – managing file paths
+
+-   `janitor` – cleaning messy data
+
+-   `ggplot2` – data visualization
+
+-   `purrr` – functional programming and iteration
+
+-   `scales` – formatting axes, labels, and colors • patchwork – combining multiple plots
+
+-   `gt` – generating professional tables
+
+-   `ggrepel` – improved text labels on plots
+
+-   `grid` – fine-tuning plot layout
+
+-   `zoo` – rolling averages (e.g., rollmean())
+
+## Data Wrangling (Full Code)
+
+Below is the complete code used to clean, join, and prepare the data used in this report.
+
+```{r eval=FALSE, echo=TRUE, ref.label=c("Packages", "outcomes-clean", "outcomes-age-fix", "intake-clean", "intake-age-parse", "intake-fix-names", "join-stays" )}
+#| warning: false
+```
